@@ -16,7 +16,12 @@
 
 package com.example.androidthings.gattserver;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -24,6 +29,7 @@ import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattServer;
 import android.bluetooth.BluetoothGattServerCallback;
+import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.AdvertiseCallback;
@@ -35,8 +41,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.graphics.BitmapFactory;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Message;
 import android.os.ParcelUuid;
+import android.os.PowerManager;
+import android.support.v4.app.NotificationCompat;
 import android.text.format.DateFormat;
 import android.util.Log;
 import android.view.WindowManager;
@@ -57,8 +70,11 @@ public class GattServerActivity extends Activity {
     private BluetoothGattServer mBluetoothGattServer;
     private BluetoothLeAdvertiser mBluetoothLeAdvertiser;
     /* Collection of notification subscribers */
-    private Set<BluetoothDevice> mRegisteredDevices = new HashSet<>();
-
+    private final Set<BluetoothDevice> mRegisteredDevices = new HashSet<>();
+    private HandlerThread mHandlerThread;
+    private Handler mWorkHandler;
+    private static int MSG_TIMER = 1;
+    private static final int DEFAULT_TIMER_MS = 150;//ms
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -87,6 +103,31 @@ public class GattServerActivity extends Activity {
             startAdvertising();
             startServer();
         }
+        mHandlerThread = new HandlerThread("handlerThread");
+        mHandlerThread.start();
+        mWorkHandler = new Handler( mHandlerThread.getLooper() ) {
+            private  final int MSG_TIMER = 1;
+        @Override
+        public void handleMessage(Message msg) {
+                Log.d(TAG,"handleMessage what="+msg.what+",timer="+msg.arg1);
+                
+                switch(msg.what){
+                    case MSG_TIMER:
+                        if(!mRegisteredDevices.isEmpty())
+                            sendDelayTimer(msg.arg1);
+                        long now = System.currentTimeMillis();
+                        notifyRegisteredDevices(now, TimeProfile.ADJUST_NONE);
+//                        try {
+//                            Thread.sleep(msg.arg1);
+//                        } catch (InterruptedException e) {
+//                            e.printStackTrace();
+//                        }
+                        break;
+                    default:
+                        break;
+                }
+        }
+        };
     }
 
     @Override
@@ -117,6 +158,8 @@ public class GattServerActivity extends Activity {
         }
 
         unregisterReceiver(mBluetoothReceiver);
+        mWorkHandler.removeCallbacksAndMessages(null);
+        mHandlerThread.quit();
     }
 
     /**
@@ -143,7 +186,7 @@ public class GattServerActivity extends Activity {
      * Listens for system time changes and triggers a notification to
      * Bluetooth subscribers.
      */
-    private BroadcastReceiver mTimeReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver mTimeReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             byte adjustReason;
@@ -169,7 +212,7 @@ public class GattServerActivity extends Activity {
      * Listens for Bluetooth adapter events to enable/disable
      * advertising and server functionality.
      */
-    private BroadcastReceiver mBluetoothReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver mBluetoothReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF);
@@ -257,7 +300,7 @@ public class GattServerActivity extends Activity {
     /**
      * Callback to receive information about the advertisement process.
      */
-    private AdvertiseCallback mAdvertiseCallback = new AdvertiseCallback() {
+    private final AdvertiseCallback mAdvertiseCallback = new AdvertiseCallback() {
         @Override
         public void onStartSuccess(AdvertiseSettings settingsInEffect) {
             Log.i(TAG, "LE Advertise Started.");
@@ -305,19 +348,23 @@ public class GattServerActivity extends Activity {
      * Callback to handle incoming requests to the GATT server.
      * All read/write requests for characteristics and descriptors are handled here.
      */
-    private BluetoothGattServerCallback mGattServerCallback = new BluetoothGattServerCallback() {
-
+    private final BluetoothGattServerCallback mGattServerCallback = new BluetoothGattServerCallback() {
+        private final String TAG = "BluetoothGattServerCallback";
         @Override
         public void onConnectionStateChange(BluetoothDevice device, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.i(TAG, "BluetoothDevice CONNECTED: " + device);
+                sendSystemUINotification();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i(TAG, "BluetoothDevice DISCONNECTED: " + device);
                 //Remove device from any active subscriptions
                 mRegisteredDevices.remove(device);
             }
         }
-
+        @Override
+        public void onServiceAdded(int status, BluetoothGattService service) {
+            Log.i(TAG,"onServiceAdded status:"+status+"service UUID"+service.getUuid());
+        }
         @Override
         public void onCharacteristicReadRequest(BluetoothDevice device, int requestId, int offset,
                                                 BluetoothGattCharacteristic characteristic) {
@@ -329,6 +376,7 @@ public class GattServerActivity extends Activity {
                         BluetoothGatt.GATT_SUCCESS,
                         0,
                         TimeProfile.getExactTime(now, TimeProfile.ADJUST_NONE));
+                sendSystemUINotification();
             } else if (TimeProfile.LOCAL_TIME_INFO.equals(characteristic.getUuid())) {
                 Log.i(TAG, "Read LocalTimeInfo");
                 mBluetoothGattServer.sendResponse(device,
@@ -382,6 +430,7 @@ public class GattServerActivity extends Activity {
                 if (Arrays.equals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, value)) {
                     Log.d(TAG, "Subscribe device to notifications: " + device);
                     mRegisteredDevices.add(device);
+                    sendTimer();
                 } else if (Arrays.equals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE, value)) {
                     Log.d(TAG, "Unsubscribe device from notifications: " + device);
                     mRegisteredDevices.remove(device);
@@ -406,4 +455,40 @@ public class GattServerActivity extends Activity {
             }
         }
     };
+    private void sendSystemUINotification(){
+        Log.i(TAG,"sendSystemUINotification");
+        Intent notificationIntent=new Intent(this,GattServerActivity.class);
+        PendingIntent pendingIntent=PendingIntent.getActivity(this,0,notificationIntent,0);
+        NotificationManager manager = (NotificationManager)getSystemService(NOTIFICATION_SERVICE);
+        //创建通知通道
+        NotificationChannel notificationChannel = null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            notificationChannel = new NotificationChannel("defalut", "name", NotificationManager.IMPORTANCE_HIGH);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(notificationChannel);
+        }
+        Notification notification = new NotificationCompat.Builder(this,"defalut")
+                .setContentTitle("通过蓝牙广播该设备")
+                .setContentText("该设备会被附近的其他设备发现")
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setLargeIcon(BitmapFactory.decodeResource(getResources(),
+                        R.mipmap.ic_launcher))
+                .setContentIntent(pendingIntent)
+                .build();
+        manager.notify(1,notification);
+        
+    }
+    private void sendTimer(){
+        Message msg = Message.obtain();
+        msg.what = MSG_TIMER;
+        msg.arg1 = DEFAULT_TIMER_MS;
+        mWorkHandler.sendMessage(msg);
+    }
+    private void sendDelayTimer(int delay){
+        Message msg = Message.obtain();
+        msg.what = MSG_TIMER;
+        msg.arg1 = DEFAULT_TIMER_MS;
+        mWorkHandler.sendMessageDelayed(msg,delay);
+    }
 }
